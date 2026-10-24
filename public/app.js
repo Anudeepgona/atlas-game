@@ -143,8 +143,230 @@
     if (code && ss.get(tokenKey(code))) joinRoom();
     else render();
   });
-  socket.on('disconnect', () => { if (state) toast('Connection lost. Reconnecting…'); });
+  socket.on('disconnect', () => {
+    for (const id of [...voice.peers.keys()]) dropPeer(id);
+    if (state) toast('Connection lost. Reconnecting…');
+  });
   socket.on('state', onState);
+
+  // ---------- voice chat ----------
+  // Audio goes straight between browsers (WebRTC). The server only relays connection details,
+  // so it never hears anything. Mute just switches the mic track off; the call stays up.
+  const RTC_CONFIG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }] };
+  const voice = { mode: 'off', stream: null, peers: new Map(), meters: new Map(), failed: new Map(), ctx: null };
+
+  async function joinVoice() {
+    if (!window.RTCPeerConnection || !navigator.mediaDevices) return toast('Voice chat doesn’t work in this browser. Try Chrome or Safari.');
+    try {
+      voice.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      meter(state && state.you, voice.stream);
+      setVoice('on');
+      toast('You’re in voice chat! Tap 🎙️ to mute.');
+    } catch {
+      voice.stream = null;
+      setVoice('listen');
+      toast('Mic is blocked, so you can listen but not talk. Allow the microphone for this site to talk.');
+    }
+  }
+
+  function setVoice(mode) {
+    // Switching between talking and listening-only changes what we send, so reconnect everyone.
+    const reconnect = (voice.mode === 'listen') !== (mode === 'listen') && voice.mode !== 'off';
+    voice.mode = mode;
+    if (voice.stream) voice.stream.getAudioTracks().forEach((t) => { t.enabled = mode === 'on'; });
+    ls.set('atlas.voice', mode !== 'off');
+    if (reconnect) {
+      for (const id of [...voice.peers.keys()]) {
+        dropPeer(id);
+        socket.emit('rtc', { to: id, data: { renew: true } });
+      }
+    }
+    if (socket.connected) socket.emit('voice', mode);
+    render();
+  }
+
+  function leaveVoice() {
+    for (const id of [...voice.peers.keys()]) dropPeer(id);
+    if (voice.stream) voice.stream.getTracks().forEach((t) => t.stop());
+    voice.stream = null;
+    voice.meters.clear();
+    voice.failed.clear();
+    voice.mode = 'off';
+    ls.set('atlas.voice', false);
+    if (socket.connected && state) socket.emit('voice', 'off');
+    render();
+  }
+
+  function onVoiceTap() {
+    if (voice.mode === 'off' || voice.mode === 'listen') joinVoice();
+    else setVoice(voice.mode === 'on' ? 'muted' : 'on');
+  }
+
+  // Back in the room after a refresh: rejoin voice by itself if the browser already allows the mic.
+  async function resumeVoice() {
+    if (voice.mode !== 'off') { socket.emit('voice', voice.mode); return; }
+    if (!ls.get('atlas.voice', false)) return;
+    try {
+      const perm = await navigator.permissions.query({ name: 'microphone' });
+      if (perm.state === 'granted') joinVoice();
+    } catch { /* permissions API missing: wait for a tap */ }
+  }
+
+  function dropPeer(id) {
+    const peer = voice.peers.get(id);
+    if (!peer) return;
+    peer.pc.close();
+    if (peer.audio) { peer.audio.srcObject = null; peer.audio.remove(); }
+    voice.peers.delete(id);
+    voice.meters.delete(id);
+  }
+
+  function makePeer(id) {
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    const peer = { pc, audio: null, pending: [] };
+    voice.peers.set(id, peer);
+    if (voice.stream) voice.stream.getTracks().forEach((t) => pc.addTrack(t, voice.stream));
+    else pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.onicecandidate = (e) => { if (e.candidate) socket.emit('rtc', { to: id, data: { candidate: e.candidate.toJSON() } }); };
+    pc.ontrack = (e) => {
+      if (!peer.audio) {
+        peer.audio = document.createElement('audio');
+        peer.audio.autoplay = true;
+        peer.audio.playsInline = true;
+        document.body.appendChild(peer.audio);
+      }
+      const stream = e.streams[0] || new MediaStream([e.track]);
+      peer.audio.srcObject = stream;
+      peer.audio.play().catch(() => {});
+      meter(id, stream);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') voice.failed.delete(id);
+      if (pc.connectionState === 'failed') {
+        voice.failed.set(id, (voice.failed.get(id) || 0) + 1);
+        dropPeer(id);
+        render();
+        setTimeout(syncVoice, 1000);
+      }
+    };
+    return peer;
+  }
+
+  async function callPeer(id) {
+    const peer = makePeer(id);
+    try {
+      await peer.pc.setLocalDescription(await peer.pc.createOffer());
+      socket.emit('rtc', { to: id, data: { sdp: peer.pc.localDescription.toJSON() } });
+    } catch (err) {
+      console.warn('voice call failed', err);
+      dropPeer(id);
+    }
+  }
+
+  socket.on('rtc', async ({ from, data }) => {
+    if (voice.mode === 'off' || !data) return;
+    try {
+      let peer = voice.peers.get(from);
+      if (data.renew) {
+        dropPeer(from);
+        syncVoice();
+        return;
+      }
+      if (data.sdp && data.sdp.type === 'offer') {
+        if (peer) dropPeer(from);
+        peer = makePeer(from);
+        await peer.pc.setRemoteDescription(data.sdp);
+        await peer.pc.setLocalDescription(await peer.pc.createAnswer());
+        socket.emit('rtc', { to: from, data: { sdp: peer.pc.localDescription.toJSON() } });
+      } else if (data.sdp && peer) {
+        await peer.pc.setRemoteDescription(data.sdp);
+      } else if (data.candidate && peer) {
+        if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(data.candidate).catch(() => {});
+        else peer.pending.push(data.candidate);
+        return;
+      }
+      if (peer && peer.pc.remoteDescription) {
+        for (const c of peer.pending.splice(0)) await peer.pc.addIceCandidate(c).catch(() => {});
+      }
+    } catch (err) {
+      console.warn('voice signal failed', err);
+    }
+  });
+
+  // Connect to everyone else in voice. Exactly one side of each pair starts the call: the smaller id.
+  function syncVoice() {
+    if (!state) return;
+    const others = new Set(state.players.filter((p) => p.id !== state.you && p.connected && p.voice && p.voice !== 'off').map((p) => p.id));
+    for (const id of [...voice.peers.keys()]) if (voice.mode === 'off' || !others.has(id)) dropPeer(id);
+    if (voice.mode === 'off') return;
+    for (const id of others) {
+      if (voice.peers.has(id) || (voice.failed.get(id) || 0) >= 3) continue;
+      if (state.you < id) callPeer(id);
+    }
+  }
+
+  // "Who's talking" glow next to names.
+  function meter(id, stream) {
+    if (!id || !stream) return;
+    try {
+      voice.ctx = voice.ctx || new (window.AudioContext || window.webkitAudioContext)();
+      if (voice.ctx.state === 'suspended') voice.ctx.resume();
+      const analyser = voice.ctx.createAnalyser();
+      analyser.fftSize = 512;
+      voice.ctx.createMediaStreamSource(stream).connect(analyser);
+      voice.meters.set(id, { analyser, buf: new Uint8Array(analyser.fftSize) });
+    } catch { /* no level meter, voice still works */ }
+  }
+  setInterval(() => {
+    if (!state || voice.mode === 'off') return;
+    for (const el of document.querySelectorAll('[data-voice]')) {
+      const id = el.dataset.voice;
+      const m = voice.meters.get(id);
+      const p = state.players.find((x) => x.id === id);
+      let talking = false;
+      if (m && p && p.voice === 'on') {
+        m.analyser.getByteTimeDomainData(m.buf);
+        let sum = 0;
+        for (const v of m.buf) sum += (v - 128) * (v - 128);
+        talking = Math.sqrt(sum / m.buf.length) > 6;
+      }
+      el.classList.toggle('talking', talking);
+    }
+  }, 200);
+
+  function voiceIcon(p) {
+    const v = p.voice || 'off';
+    if (v === 'off') return '';
+    const icon = { on: '🎙️', muted: '🔇', listen: '👂' }[v];
+    const title = { on: 'In voice chat', muted: 'Muted', listen: 'Listening only' }[v];
+    const stuck = p.id !== state.you && voice.mode !== 'off' && (voice.failed.get(p.id) || 0) >= 3;
+    return ` <span class="vc" data-voice="${esc(p.id)}" title="${stuck ? 'Can’t connect to their voice' : title}">${icon}${stuck ? '⚠️' : ''}</span>`;
+  }
+
+  function voiceSummary() {
+    const inVoice = state.players.filter((p) => p.voice && p.voice !== 'off');
+    if (!inVoice.length) return '<div class="voice-line">Want to chat while you play? Tap <b>🎤 Join voice</b> at the top.</div>';
+    const talking = inVoice.filter((p) => p.voice === 'on').length;
+    const muted = inVoice.filter((p) => p.voice === 'muted').length;
+    const listening = inVoice.filter((p) => p.voice === 'listen').length;
+    const parts = [`🎙️ ${talking} talking`];
+    if (muted) parts.push(`🔇 ${muted} muted`);
+    if (listening) parts.push(`👂 ${listening} listening`);
+    return `<div class="voice-line">Voice chat: ${parts.join(' · ')}${voice.mode === 'off' ? ' · <b>tap 🎤 to join</b>' : ''}</div>`;
+  }
+
+  function voiceChip() {
+    const m = voice.mode;
+    const label = {
+      off: '🎤<span class="lbl"> Join voice</span>',
+      on: '🎙️<span class="lbl"> Mic on</span>',
+      muted: '🔇<span class="lbl"> Muted</span>',
+      listen: '👂<span class="lbl"> Listening</span>',
+    }[m];
+    const title = { off: 'Join voice chat', on: 'Tap to mute', muted: 'Tap to unmute', listen: 'Tap to turn on your mic' }[m];
+    return `<button class="chip-btn voice-chip v-${m}" data-act="voice" title="${title}" aria-label="${title}">${label}</button>`
+      + (m !== 'off' ? '<button class="chip-btn" data-act="voice-leave" title="Leave voice chat" aria-label="Leave voice chat">✕<span class="lbl"> Leave voice</span></button>' : '');
+  }
 
   function joinRoom() {
     if (!code) return;
@@ -165,6 +387,7 @@
       }
       ss.set(tokenKey(res.code), res.token);
       render();
+      resumeVoice();
     });
     render();
   }
@@ -181,6 +404,7 @@
   }
 
   function leaveRoom() {
+    leaveVoice();
     socket.emit('leave');
     if (code) ss.del(tokenKey(code));
     code = null;
@@ -200,6 +424,7 @@
       else if (s.phase === 'ended' && before.phase !== 'ended') sfx.chime();
     }
     render();
+    syncVoice();
   }
 
   // ---------- DOM patching ----------
@@ -207,6 +432,7 @@
     if (mounted === name) return false;
     app.innerHTML = html;
     mounted = name;
+    window.scrollTo(0, 0);
     return true;
   }
   function patch(id, html) {
@@ -261,6 +487,7 @@
     return `<div class="topbar">
       <a class="logo" href="/" data-act="home">${GLOBE}<span>ATLAS</span></a>
       <div class="tools">
+        ${state ? voiceChip() : ''}
         ${extra || ''}
         <button class="chip-btn code-chip" data-act="copy" title="Copy the invite link">Room ${esc(code)} ⧉</button>
         <button class="chip-btn" data-act="mute" id="mute-btn" aria-label="Sound">${muteLabel()}</button>
@@ -330,7 +557,7 @@
     const my = me();
     mount('lobby', `
       <div class="wrap">
-        ${topbar()}
+        <div id="topbar"></div>
         <div class="lobby-grid">
           <div>
             <div class="nb" id="register-page"></div>
@@ -342,6 +569,7 @@
         </div>
       </div>`);
     document.getElementById('register-page').className = `nb nb-${my.notebook}`;
+    patch('topbar', topbar());
 
     const players = state.players;
     const reg = `
@@ -351,11 +579,12 @@
         ${players.map((p, i) => `<tr>
           <td class="roll">${i + 1}.</td>
           <td><span class="mini-cover cover-${p.cover}"></span>${hw(p.name, p.id, p.font, p.ink)}
-            ${p.id === state.hostId ? ' <span class="tag">Monitor</span>' : ''}${p.id === state.you ? ' <span class="by">(you)</span>' : ''}</td>
+            ${p.id === state.hostId ? ' <span class="tag">Monitor</span>' : ''}${p.id === state.you ? ' <span class="by">(you)</span>' : ''}${voiceIcon(p)}</td>
           <td class="present" style="${p.connected ? '' : 'color:var(--red)'}">${p.connected ? 'P' : 'A'}</td>
         </tr>`).join('')}
       </table>
       <div class="line hint">${players.length} of ${state.settings.maxPlayers} seats taken</div>
+      ${voiceSummary()}
       <div class="share">
         <code>${esc(roomLink())}</code>
         <button class="btn small" data-act="share">Share</button>
@@ -499,12 +728,13 @@
         <li>
           <span class="rank">${p.rank}.</span>
           <span class="dot ${p.connected ? '' : 'off'}" title="${p.connected ? 'Online' : 'Away'}"></span>
-          <span class="nm">${esc(p.name)}${p.id === state.you ? ' (you)' : ''}</span>
+          <span class="nm">${esc(p.name)}${p.id === state.you ? ' (you)' : ''}${voiceIcon(p)}</span>
           ${p.id === state.hostId ? '<span class="tag" title="Runs the game">Monitor</span>' : ''}
           ${writing && p.playing ? `<span class="by">${p.done ? '✓' : '✎'}</span>` : ''}
           <span class="pts">${p.score}</span>
         </li>`).join('')}
-      </ul>`;
+      </ul>
+      ${voiceSummary()}`;
   }
 
   // ----- picking a letter -----
@@ -758,16 +988,13 @@
 
   // ---------- report card ----------
   function renderEnded() {
-    const my = me();
     mount('ended', `
       <div class="wrap">
         <div id="topbar"></div>
         <div class="report" id="report"></div>
-        <div class="nb" id="final-page"><div id="final-top"></div><div id="final-body"></div></div>
       </div>`);
     stopFlip();
     patch('topbar', topbar());
-    document.getElementById('final-page').className = `nb nb-${my.notebook}`;
     const list = rankList(state.players);
     const top = list.length ? list[0].score : 0;
     const grade = (s) => {
@@ -802,15 +1029,7 @@
         ${isHost() ? '<button class="btn primary" data-act="again">Play again</button>' : `<span class="hint">The monitor (${esc(playerName(state.hostId))}) can start a new game.</span>`}
         <button class="btn" data-act="leave">Leave</button>
       </div>`);
-    patch('final-top', pageTop('<span class="title" style="font-family:\'Gochi Hand\',cursive;font-size:24px">Our notebook</span>'));
-    const items = [];
-    for (const r of state.history) {
-      animated.add('r' + r.n);
-      items.push({ key: 'r' + r.n, html: roundBlock(r, false) });
-      items.push({ key: 'ruler' + r.n, html: '<div class="ruler" aria-hidden="true"></div>' });
-    }
-    patchList(document.getElementById('final-body'), items);
-    fitResults();
+    for (const r of state.history) animated.add('r' + r.n);
   }
 
   // ---------- clocks ----------
@@ -900,6 +1119,8 @@
         if (navigator.share) navigator.share({ title: 'ATLAS', text: 'Come play ATLAS with me!', url: roomLink() }).catch(() => {});
         else copyLink();
         break;
+      case 'voice': onVoiceTap(); break;
+      case 'voice-leave': leaveVoice(); break;
       case 'mute':
         muted = !muted;
         ls.set('atlas.muted', muted);

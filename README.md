@@ -46,7 +46,8 @@ It's a plain Node 18+ app. Run `npm install`, then `npm start`. It listens on `P
   - Marks update as soon as the vote passes, and you can tap again to take your vote back. A yellow "Class court is open!" panel above the marks explains this every round.
 - **The notebook:** older rounds fold into one line (letter plus everyone's marks), and you can tap to open them. Each new round is written under the last one, with a double line drawn across the page in between. Everyone sees it in their own notebook (ruled, four-line, plain, maths squares, or a crumpled paper-ball page), with each friend's answers in that friend's handwriting and pen colour.
 - **Small screens:** if the marks table doesn't fit, it switches to one block per column, so there's never a sideways scroll.
-- **Report card** at the end, with ranks, grades and cheeky remarks, signed by the class teacher, S. Radhakrishnan.
+- **Voice chat:** tap **🎤 Join voice** in the top bar. The browser asks for the microphone once (it remembers after that), and the same button then switches between 🎙️ mic on and 🔇 muted. ✕ leaves voice. If the mic is blocked you can still join as 👂 listening only. Everyone's status shows next to their name, and the icon glows while someone is talking. Audio goes directly between players' browsers (WebRTC, up to about 8 people); the server only passes along connection details and never hears anything. After a refresh you rejoin voice by yourself if the browser already allows the mic.
+- **Report card** at the end (just the report, at the top of the page), with ranks, grades and cheeky remarks, signed by the class teacher, S. Radhakrishnan.
 - **Leaving and ending:** anyone can leave at any time; their earlier answers stay in the notebook. Only the Monitor (whoever made the room) can end the game early. If the Monitor leaves, the next player takes over so the game never gets stuck. *Play again* goes back to the lobby.
 
 ### Edge cases handled

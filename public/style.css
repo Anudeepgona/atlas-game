@@ -543,3 +543,11 @@ body.modal-open { overflow: hidden; }
 .cc-row .obj { display: inline-flex; flex-wrap: wrap; align-items: flex-end; row-gap: 2px; }
 .note { white-space: nowrap; }
 .cell { flex-wrap: nowrap; }
+
+/* ---------- voice chat ---------- */
+.voice-chip.v-on { background: rgba(67, 160, 71, .45); border-color: #c8f0c9; }
+.voice-chip.v-muted { background: rgba(211, 38, 44, .45); border-color: #ffc9c9; }
+.voice-chip.v-listen { background: rgba(255, 216, 77, .35); }
+.vc { display: inline-block; font-size: 14px; margin-left: 4px; border-radius: 999px; padding: 0 3px; transition: box-shadow .15s, background .15s; }
+.vc.talking { background: rgba(67, 160, 71, .25); box-shadow: 0 0 0 3px rgba(67, 160, 71, .45); }
+.voice-line { font-family: 'Patrick Hand', cursive; font-size: 15px; color: var(--pencil); margin-top: 8px; line-height: 1.35; }

@@ -452,6 +452,7 @@ function buildShared(room) {
     ink: p.ink,
     cover: p.cover,
     connected: p.connected,
+    voice: p.voice || 'off',
     score: totals[p.id] || 0,
     playing: r ? r.participants.includes(p.id) : true,
     filled: r && r.answers[p.id] ? r.answers[p.id].filter((a) => a.trim()).length : 0,
@@ -668,6 +669,25 @@ io.on('connection', (socket) => {
     broadcast(room);
   });
 
+  // Voice chat. The audio goes straight between players' browsers (WebRTC);
+  // the server only shows who is in voice and passes connection details between two players.
+  socket.on('voice', (mode) => {
+    const { room, p } = ctx(socket);
+    if (!room) return;
+    p.voice = oneOf(mode, ['off', 'on', 'muted', 'listen'], 'off');
+    broadcast(room);
+  });
+
+  socket.on('rtc', (msg) => {
+    const { room, p } = ctx(socket);
+    if (!room || !msg || typeof msg !== 'object') return;
+    const to = getPlayer(room, String(msg.to || ''));
+    if (!to || to.id === p.id || !to.connected || !to.socketId) return;
+    const data = msg.data;
+    if (!data || typeof data !== 'object' || JSON.stringify(data).length > 20000) return;
+    io.to(to.socketId).emit('rtc', { from: p.id, data });
+  });
+
   socket.on('next', () => {
     const { room, p } = ctx(socket);
     if (!room || room.hostId !== p.id || room.phase !== 'reveal') return;
@@ -698,6 +718,7 @@ io.on('connection', (socket) => {
     if (!room) return;
     p.left = true;
     p.connected = false;
+    p.voice = 'off';
     socket.leave(room.code);
     socket.data = {};
     afterPlayerGone(room, p);
@@ -707,6 +728,7 @@ io.on('connection', (socket) => {
     const { room, p } = ctx(socket);
     if (!room || p.socketId !== socket.id) return;
     p.connected = false;
+    p.voice = 'off';
     broadcast(room);
     setTimeout(() => {
       if (!rooms.has(room.code) || p.connected) return;
